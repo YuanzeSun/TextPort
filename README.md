@@ -4,7 +4,7 @@
 
 主要用于解决Mac（及其他苹果设备）和Windows间传输文本困难的问题。
 
-打开同一个私密链接后，可以在 iPhone、Mac、Windows 之间发送文字，不依赖局域网。
+打开同一个私密链接后，可以在 iPhone、Mac、iPad 及 Windows 等设备间发送文字，不依赖局域网。
 
 ## 功能
 
@@ -14,19 +14,29 @@
 
 ## 使用方法
 
-在所有设备上访问同一个私密链接：
+在所有设备上访问同一个私密链接（你的真实链接会在下面的配置过程中生成）：
 
 ```text
 https://你的地址.workers.dev/#token=你的私密密钥
 ```
 
-打开后直接输入文字并点击发送。文字会暂存在云端，其他设备之后再打开同一个链接并点击刷新，就能看到最新内容；两台设备不需要同时在线。点击任意一条文字可以复制；点击清空剪切板会删除当前保存的文字。
+也可以只访问裸网址：
 
-只会保留最近 5 条文字。
+```text
+https://你的地址.workers.dev
+```
+
+然后在网页里输入 `APP_TOKEN` 并保存。浏览器会把 token 缓存在本地，之后通常不需要再次输入；如果清理了浏览器数据、换了浏览器、使用无痕模式，或者浏览器主动清掉站点数据，就需要重新输入。
+
+打开后直接输入文字并点击发送，文字会保存在云端，只会保留最近 5 条文字。其他设备之后再打开同一链接，就能看到最新内容。
+
+两台设备不需要同时在线。点击任意一条文字可以复制；点击清空剪切板会删除当前保存的文字。
 
 ## 费用
 
-个人使用，Cloudflare Workers Free + D1 Free 通常足够。
+个人使用，Cloudflare Workers Free + D1 Free 免费计划已经足够。
+
+一个直观参考：即使每天发送 100 次、刷新 500 次，也大约只是 700 次 Worker request，离免费额度 100,000 requests/day 还很远。D1 读写量也远低于免费额度。
 
 截至 2026-05-11，Cloudflare 官方计费规则大致如下：
 
@@ -125,6 +135,14 @@ npx wrangler login
 npx wrangler d1 create textport_db
 ```
 
+如果 Wrangler 问：
+
+```text
+Would you like Wrangler to add it on your behalf?
+```
+
+选择 `no`。本项目代码使用的绑定名是 `DB`，自动添加通常会用数据库名作为绑定名，容易和代码不一致。
+
 命令输出里会有类似这样的内容：
 
 ```json
@@ -167,11 +185,34 @@ npx wrangler secret put APP_TOKEN
 
 它会提示你输入值。粘贴刚才生成的随机密钥，然后回车。
 
+如果 Wrangler 问：
+
+```text
+There doesn't seem to be a Worker called "textport". Do you want to create a new Worker with that name and add secrets to it?
+```
+
+选择 `yes`。这是第一次部署前的正常提示，它会先创建同名 Worker 并保存 secret。
+
 部署：
 
 ```bash
 npx wrangler deploy
 ```
+
+如果 Wrangler 问：
+
+```text
+Would you like to register a workers.dev subdomain now?
+```
+
+选择 `yes`。这是给账号启用默认的 `workers.dev` 访问域名。
+
+部署后看到这些 warning 通常可以忽略：
+
+- `workers_dev is not in your Wrangler file`
+- `preview_urls setting is not in your Wrangler file`
+
+它们只是说明 Wrangler 使用了默认配置，不影响这个工具使用。
 
 成功后会看到 Worker 地址，类似：
 
@@ -186,39 +227,6 @@ https://textport.你的账号.workers.dev/#token=你的私密密钥
 ```
 
 把这个链接分别在 iPhone、Mac、Windows 打开即可。
-
-## 部署时常见提示
-
-创建 D1 数据库后，如果 Wrangler 问：
-
-```text
-Would you like Wrangler to add it on your behalf?
-```
-
-选择 `no`。本项目代码使用的绑定名是 `DB`，自动添加通常会用数据库名作为绑定名，容易和代码不一致。只需要手动把输出里的 `database_id` 填到 `wrangler.jsonc`。
-
-设置 `APP_TOKEN` 时，如果 Wrangler 问：
-
-```text
-There doesn't seem to be a Worker called "textport". Do you want to create a new Worker with that name and add secrets to it?
-```
-
-选择 `yes`。这是第一次部署前的正常提示，它会先创建同名 Worker 并保存 secret。
-
-第一次部署时，如果 Wrangler 问：
-
-```text
-Would you like to register a workers.dev subdomain now?
-```
-
-选择 `yes`。这是给账号启用默认的 `workers.dev` 访问域名。
-
-部署后看到这些 warning 通常可以忽略：
-
-- `workers_dev is not in your Wrangler file`
-- `preview_urls setting is not in your Wrangler file`
-
-它们只是说明 Wrangler 使用了默认配置，不影响这个工具使用。
 
 ## iPhone 使用建议
 
