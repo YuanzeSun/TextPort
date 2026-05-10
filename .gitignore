@@ -1,0 +1,9 @@
+node_modules/
+.wrangler/
+wrangler.jsonc
+.dev.vars
+.env
+.env.*
+*.log
+.DS_Store
+Thumbs.db
