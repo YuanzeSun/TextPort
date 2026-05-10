@@ -278,4 +278,10 @@ npx wrangler deploy
 
 超过 5 条的历史记录会被实际从 `messages` 表中删除，不只是前端隐藏。清空剪切板也会删除当前保存的全部文字。
 
-但从当前表里删除不等于云服务层面的不可恢复安全擦除。Cloudflare D1 有 Time Travel/恢复能力，所以不要传输密码、验证码、私钥等高敏感内容。
+但从当前表里删除不等于云服务层面的不可恢复安全擦除。Cloudflare D1 有 Time Travel/恢复能力，所以不要传输高敏感内容。
+
+## License
+
+This project is licensed under the Creative Commons Attribution-NonCommercial 4.0 International License.
+
+Commercial use is not permitted without prior written permission from Luca.
