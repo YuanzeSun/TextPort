@@ -302,6 +302,16 @@ const APP_HTML = `<!doctype html>
       margin-top: 12px;
     }
 
+    .message-actions {
+      justify-content: space-between;
+    }
+
+    .message-actions-left {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
     button {
       min-height: 42px;
       border: 1px solid var(--border);
@@ -401,6 +411,11 @@ const APP_HTML = `<!doctype html>
       text-align: center;
     }
 
+    footer a {
+      color: inherit;
+      font-weight: 700;
+    }
+
     @media (max-width: 560px) {
       main {
         padding: 20px 14px 28px;
@@ -439,6 +454,14 @@ const APP_HTML = `<!doctype html>
       .actions button.primary {
         flex-basis: 100%;
       }
+
+      .message-actions {
+        align-items: stretch;
+      }
+
+      .message-actions-left {
+        flex: 1 1 auto;
+      }
     }
   </style>
 </head>
@@ -467,10 +490,12 @@ const APP_HTML = `<!doctype html>
           <span class="hint">保存最近 5 条</span>
         </div>
         <textarea id="textInput"></textarea>
-        <div class="actions">
-          <button id="sendButton" class="primary" type="button">发送</button>
-          <button id="refreshButton" type="button">刷新</button>
-          <button id="clearButton" class="danger" type="button">清空剪切板</button>
+        <div class="actions message-actions">
+          <div class="message-actions-left">
+            <button id="sendButton" class="primary" type="button">发送</button>
+            <button id="refreshButton" type="button">刷新</button>
+          </div>
+          <button id="clearButton" class="danger" type="button">清空历史</button>
         </div>
       </section>
 
@@ -482,7 +507,7 @@ const APP_HTML = `<!doctype html>
         <div id="messages" class="message-list"></div>
       </section>
     </div>
-    <footer>Copyright © 2026 Luca. All rights reserved.</footer>
+    <footer>Copyright © 2026 Luca. All rights reserved. <a href="https://github.com/YuanzeSun/TextPort" rel="noopener noreferrer" target="_blank">GitHub</a></footer>
   </main>
 
   <script>
@@ -617,10 +642,10 @@ const APP_HTML = `<!doctype html>
     }
 
     async function clearMessages() {
-      if (!confirm("清空剪切板？")) return;
+      if (!confirm("清空历史？")) return;
       await api("/api/messages", { method: "DELETE" });
       await refreshMessages();
-      setStatus("剪切板已清空");
+      setStatus("历史已清空");
       setTimeout(() => setStatus(""), 1200);
     }
 
