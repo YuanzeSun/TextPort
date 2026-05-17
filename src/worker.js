@@ -1,5 +1,6 @@
-const MAX_MESSAGE_LENGTH = 8000;
+const MAX_MESSAGE_BYTES = 1_900_000;
 const MAX_MESSAGES = 5;
+const textEncoder = new TextEncoder();
 
 export default {
   async fetch(request, env) {
@@ -55,8 +56,8 @@ async function handleCreate(request, env) {
   if (!text) {
     return jsonResponse({ error: "Text is required" }, 400);
   }
-  if (text.length > MAX_MESSAGE_LENGTH) {
-    return jsonResponse({ error: `Text is too long. Max ${MAX_MESSAGE_LENGTH} characters.` }, 400);
+  if (getUtf8ByteLength(text) > MAX_MESSAGE_BYTES) {
+    return jsonResponse({ error: "文字过长" }, 400);
   }
 
   const createdAt = Date.now();
@@ -142,6 +143,10 @@ function robotsResponse() {
       "x-robots-tag": "noindex, nofollow"
     }
   });
+}
+
+function getUtf8ByteLength(value) {
+  return textEncoder.encode(value).length;
 }
 
 const APP_HTML = `<!doctype html>
@@ -522,6 +527,8 @@ const APP_HTML = `<!doctype html>
     const statusEl = document.querySelector("#status");
 
     const TOKEN_KEY = "textport-token";
+    const MAX_MESSAGE_BYTES = 1900000;
+    const textEncoder = new TextEncoder();
 
     function tokenFromHash() {
       const hash = new URLSearchParams(location.hash.slice(1));
@@ -545,6 +552,10 @@ const APP_HTML = `<!doctype html>
 
     function setStatus(text) {
       statusEl.textContent = text || "";
+    }
+
+    function getUtf8ByteLength(value) {
+      return textEncoder.encode(value).length;
     }
 
     async function api(path, options = {}) {
@@ -621,6 +632,10 @@ const APP_HTML = `<!doctype html>
       const text = textInput.value.trim();
       if (!text) {
         setStatus("请输入文字");
+        return;
+      }
+      if (getUtf8ByteLength(text) > MAX_MESSAGE_BYTES) {
+        setStatus("文字过长");
         return;
       }
 
