@@ -14,6 +14,10 @@ export default {
       return robotsResponse();
     }
 
+    if (url.pathname === "/favicon.svg" && request.method === "GET") {
+      return svgResponse(FAVICON_SVG);
+    }
+
     if (url.pathname === "/api/messages" && request.method === "GET") {
       return handleList(request, env);
     }
@@ -24,6 +28,11 @@ export default {
 
     if (url.pathname === "/api/messages" && request.method === "DELETE") {
       return handleClear(request, env);
+    }
+
+    const messageMatch = url.pathname.match(/^\/api\/messages\/(\d+)$/);
+    if (messageMatch && request.method === "DELETE") {
+      return handleDelete(request, env, Number(messageMatch[1]));
     }
 
     return jsonResponse({ error: "Not found" }, 404);
@@ -78,6 +87,18 @@ async function handleClear(request, env) {
 
   await env.DB.prepare("DELETE FROM messages").run();
   return jsonResponse({ ok: true });
+}
+
+async function handleDelete(request, env, id) {
+  const unauthorized = await requireAuth(request, env);
+  if (unauthorized) return unauthorized;
+
+  if (!Number.isSafeInteger(id) || id < 1) {
+    return jsonResponse({ error: "Invalid message id" }, 400);
+  }
+
+  const result = await env.DB.prepare("DELETE FROM messages WHERE id = ?").bind(id).run();
+  return jsonResponse({ ok: true, deleted: result.meta.changes > 0 });
 }
 
 async function requireAuth(request, env) {
@@ -145,15 +166,34 @@ function robotsResponse() {
   });
 }
 
+function svgResponse(svg) {
+  return new Response(svg, {
+    headers: {
+      "content-type": "image/svg+xml; charset=utf-8",
+      "cache-control": "public, max-age=86400",
+      "x-robots-tag": "noindex, nofollow"
+    }
+  });
+}
+
 function getUtf8ByteLength(value) {
   return textEncoder.encode(value).length;
 }
+
+const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="14" fill="#2563eb"/>
+  <path d="M18 14h21l9 9v27H18z" fill="#fff" opacity=".96"/>
+  <path d="M39 14v10h9" fill="none" stroke="#bfdbfe" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M20 39h19" fill="none" stroke="#2563eb" stroke-width="5" stroke-linecap="round"/>
+  <path d="m34 30 10 9-10 9" fill="none" stroke="#2563eb" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`;
 
 const APP_HTML = `<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <title>TextPort</title>
   <style>
     :root {
@@ -271,6 +311,10 @@ const APP_HTML = `<!doctype html>
       line-height: 1.35;
     }
 
+    .character-count {
+      white-space: nowrap;
+    }
+
     textarea,
     input {
       width: 100%;
@@ -377,8 +421,10 @@ const APP_HTML = `<!doctype html>
       border: 1px solid var(--border);
       border-radius: 8px;
       background: var(--surface);
+      cursor: pointer;
       text-align: left;
       padding: 12px 13px;
+      transition: border-color 140ms ease, background 140ms ease;
     }
 
     .message:hover {
@@ -386,11 +432,83 @@ const APP_HTML = `<!doctype html>
       background: color-mix(in srgb, var(--surface) 88%, var(--surface-soft));
     }
 
+    .message:focus-visible {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 4px var(--focus);
+      outline: none;
+    }
+
+    .message-body {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      gap: 8px;
+      align-items: start;
+    }
+
     .message-text {
+      min-width: 0;
       white-space: pre-wrap;
       overflow-wrap: anywhere;
       font-size: 15px;
+      font-weight: 400;
       line-height: 1.5;
+    }
+
+    .message.is-collapsed .message-text {
+      position: relative;
+      max-height: 7.5em;
+      overflow: hidden;
+    }
+
+    .message.is-collapsed .message-text::after {
+      content: "";
+      position: absolute;
+      right: 0;
+      bottom: 0;
+      left: 0;
+      height: 2.2em;
+      background: linear-gradient(180deg, transparent, var(--surface));
+      pointer-events: none;
+    }
+
+    .message.is-collapsed:hover .message-text::after {
+      background: linear-gradient(
+        180deg,
+        transparent,
+        color-mix(in srgb, var(--surface) 88%, var(--surface-soft))
+      );
+    }
+
+    .message-icon-button {
+      display: grid;
+      place-items: center;
+      width: 28px;
+      height: 28px;
+      min-height: 28px;
+      border-radius: 6px;
+      color: var(--muted);
+      padding: 0;
+    }
+
+    .message-toggle {
+      visibility: hidden;
+      pointer-events: none;
+    }
+
+    .message.is-collapsible .message-toggle {
+      visibility: visible;
+      pointer-events: auto;
+    }
+
+    .message-delete {
+      border-color: color-mix(in srgb, var(--danger) 38%, var(--border));
+      background: var(--danger-bg);
+      color: var(--danger);
+    }
+
+    .message-delete:hover {
+      border-color: var(--danger);
+      color: var(--danger);
     }
 
     .message-time {
@@ -492,7 +610,7 @@ const APP_HTML = `<!doctype html>
       <section>
         <div class="section-head">
           <label for="textInput">发送文字</label>
-          <span class="hint">保存最近 5 条</span>
+          <span id="characterCount" class="hint character-count">0 字符 · 保存最近 5 条</span>
         </div>
         <textarea id="textInput"></textarea>
         <div class="actions message-actions">
@@ -525,10 +643,16 @@ const APP_HTML = `<!doctype html>
     const clearButton = document.querySelector("#clearButton");
     const messagesEl = document.querySelector("#messages");
     const statusEl = document.querySelector("#status");
+    const characterCountEl = document.querySelector("#characterCount");
 
     const TOKEN_KEY = "textport-token";
     const MAX_MESSAGE_BYTES = 1900000;
+    const COLLAPSE_MESSAGE_CHARACTERS = 360;
+    const COLLAPSE_MESSAGE_LINES = 8;
     const textEncoder = new TextEncoder();
+    const characterSegmenter = typeof Intl !== "undefined" && Intl.Segmenter
+      ? new Intl.Segmenter("zh-CN", { granularity: "grapheme" })
+      : null;
 
     function tokenFromHash() {
       const hash = new URLSearchParams(location.hash.slice(1));
@@ -556,6 +680,26 @@ const APP_HTML = `<!doctype html>
 
     function getUtf8ByteLength(value) {
       return textEncoder.encode(value).length;
+    }
+
+    function countCharacters(value) {
+      if (!value) return 0;
+      if (!characterSegmenter) return Array.from(value).length;
+
+      let count = 0;
+      for (const _segment of characterSegmenter.segment(value)) {
+        count += 1;
+      }
+      return count;
+    }
+
+    function updateCharacterCount() {
+      characterCountEl.textContent = countCharacters(textInput.value) + " 字符 · 保存最近 5 条";
+    }
+
+    function isLongMessage(text) {
+      return Array.from(text).length > COLLAPSE_MESSAGE_CHARACTERS
+        || text.split(/\\r\\n|\\r|\\n/).length > COLLAPSE_MESSAGE_LINES;
     }
 
     async function api(path, options = {}) {
@@ -593,20 +737,46 @@ const APP_HTML = `<!doctype html>
       }
 
       for (const message of messages) {
-        const button = document.createElement("button");
-        button.className = "message";
-        button.type = "button";
+        const item = document.createElement("div");
+        item.className = "message";
+        item.role = "button";
+        item.tabIndex = 0;
+
+        const body = document.createElement("div");
+        body.className = "message-body";
 
         const text = document.createElement("div");
         text.className = "message-text";
         text.textContent = message.text;
 
+        const toggle = document.createElement("button");
+        toggle.className = "message-icon-button message-toggle";
+        toggle.type = "button";
+        toggle.textContent = "▶";
+        toggle.title = "展开";
+        toggle.setAttribute("aria-label", "展开消息");
+        toggle.setAttribute("aria-expanded", "false");
+
+        const deleteButton = document.createElement("button");
+        deleteButton.className = "message-icon-button message-delete";
+        deleteButton.type = "button";
+        deleteButton.textContent = "×";
+        deleteButton.title = "删除";
+        deleteButton.setAttribute("aria-label", "删除消息");
+
         const time = document.createElement("div");
         time.className = "message-time";
         time.textContent = new Date(message.created_at).toLocaleString();
 
-        button.append(text, time);
-        button.addEventListener("click", async () => {
+        const isCollapsible = isLongMessage(message.text);
+        if (isCollapsible) {
+          item.classList.add("is-collapsible", "is-collapsed");
+        }
+
+        body.append(text, toggle, deleteButton);
+        item.append(body, time);
+
+        const copyMessage = async () => {
           try {
             await navigator.clipboard.writeText(message.text);
             setStatus("已复制");
@@ -614,9 +784,38 @@ const APP_HTML = `<!doctype html>
           } catch {
             setStatus("复制失败，请手动选择文字");
           }
+        };
+
+        item.addEventListener("click", copyMessage);
+        item.addEventListener("keydown", (event) => {
+          if (event.key !== "Enter" && event.key !== " ") return;
+          event.preventDefault();
+          copyMessage();
         });
 
-        messagesEl.append(button);
+        toggle.addEventListener("click", (event) => {
+          event.stopPropagation();
+          const isExpanded = item.classList.toggle("is-expanded");
+          item.classList.toggle("is-collapsed", !isExpanded);
+          toggle.textContent = isExpanded ? "▼" : "▶";
+          toggle.title = isExpanded ? "折叠" : "展开";
+          toggle.setAttribute("aria-label", isExpanded ? "折叠消息" : "展开消息");
+          toggle.setAttribute("aria-expanded", String(isExpanded));
+        });
+
+        deleteButton.addEventListener("click", async (event) => {
+          event.stopPropagation();
+          if (!confirm("删除这条历史？")) return;
+
+          deleteButton.disabled = true;
+          try {
+            await deleteMessage(message.id);
+          } finally {
+            deleteButton.disabled = false;
+          }
+        });
+
+        messagesEl.append(item);
       }
     }
 
@@ -648,6 +847,7 @@ const APP_HTML = `<!doctype html>
           body: JSON.stringify({ text })
         });
         textInput.value = "";
+        updateCharacterCount();
         await refreshMessages();
         setStatus("已发送");
         setTimeout(() => setStatus(""), 1200);
@@ -661,6 +861,13 @@ const APP_HTML = `<!doctype html>
       await api("/api/messages", { method: "DELETE" });
       await refreshMessages();
       setStatus("历史已清空");
+      setTimeout(() => setStatus(""), 1200);
+    }
+
+    async function deleteMessage(id) {
+      await api("/api/messages/" + encodeURIComponent(id), { method: "DELETE" });
+      await refreshMessages();
+      setStatus("已删除");
       setTimeout(() => setStatus(""), 1200);
     }
 
@@ -685,7 +892,13 @@ const APP_HTML = `<!doctype html>
       clearMessages().catch((error) => setStatus(error.message));
     });
 
+    textInput.addEventListener("input", updateCharacterCount);
+    textInput.addEventListener("change", updateCharacterCount);
+    textInput.addEventListener("keyup", updateCharacterCount);
+    textInput.addEventListener("paste", () => requestAnimationFrame(updateCharacterCount));
+
     requireToken();
+    updateCharacterCount();
     refreshMessages().catch((error) => setStatus(error.message));
   </script>
 </body>
