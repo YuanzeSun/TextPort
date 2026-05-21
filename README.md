@@ -294,6 +294,4 @@ npx wrangler deploy
 
 ## License
 
-This project is licensed under the Creative Commons Attribution-NonCommercial 4.0 International License.
-
-Commercial use is not permitted without prior written permission from Luca.
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
