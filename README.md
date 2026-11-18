@@ -1,297 +1,33 @@
 # TextPort
 
-一个极简的跨设备文字共享工具。
+一个极简的跨设备文字共享工具。在 iPhone、iPad、Mac 或 Windows 上打开同一个私密链接，就能互传文字。两台设备可以先后上线，也可以用不同的网络。
 
-主要用于解决Mac（及其他苹果设备）和Windows间传输文本困难的问题（尤其是使用微信文件传输助手时，PC端和Mac端相互冲突；若使用文件传输助手网页版每次都需要手机扫码登录又十分麻烦）。
+## 怎么用
 
-打开同一个私密链接后，可以在 iPhone、Mac、iPad 及 Windows 等设备间发送文字，不依赖局域网。
+在一台设备上输入文字并发送，在另一台设备打开或刷新页面即可看到。只保留最近 5 条，点击文字可复制，也可以删除单条或清空历史。
 
-代码开源，自行部署，安全可靠。
-
-## 功能
-
-- 发送文字
-- 查看最近 5 条文字
-- 点击任意文字自动复制
-
-## 使用方法
-
-在所有设备上访问同一个私密链接（你的真实链接会在下面的配置过程中生成）：
+部署后，打开 Worker 地址，在页面输入 `APP_TOKEN` 并保存。也可以把密钥放在私密链接里，方便在自己的设备间使用。
 
 ```text
-https://你的地址.workers.dev/#token=你的私密密钥
+https://textport.example.workers.dev/#token=YOUR_TOKEN
 ```
 
-也可以只访问裸网址：
+请妥善保管密钥和带密钥的链接。
 
-```text
-https://你的地址.workers.dev
-```
+## 在 Cloudflare 控制台部署
 
-然后在网页里输入 `APP_TOKEN` 并保存。浏览器会把 token 缓存在本地，之后通常不需要再次输入；如果清理了浏览器数据、换了浏览器、使用无痕模式，或者浏览器主动清掉站点数据，就需要重新输入。
+整个过程可以在浏览器里完成。
 
-打开后直接输入文字并点击发送，文字会保存在云端，只会保留最近 5 条文字。其他设备之后再打开同一链接，就能看到最新内容。
-
-点击任意一条文字可以复制；点击清空历史会删除当前所有保存的文字。
-
-两台设备不需要同时在线。
+1. 打开 **D1 SQL Database**，新建 `textport_db`。进入这个库的 **Console**，粘贴并执行 [初始化 SQL](migrations/0001_create_messages.sql)。
+2. 在 **Workers & Pages** 用 Hello World 模板新建 `textport`。打开 **Edit Code**，用 [Worker 源码](src/worker.js) 替换模板内容，点击 **Deploy**。
+3. 在 Worker 的 **Bindings → Add binding → D1 database** 中，变量名填 `DB`，数据库选刚创建的 `textport_db`。
+4. 在 **Settings → Variables and Secrets** 添加类型为 **Secret** 的 `APP_TOKEN`，值填自行生成的随机字母数字密钥，再点 **Deploy**。
+5. 打开部署生成的 `workers.dev` 地址，输入刚才设置的密钥。
 
 ## 费用
 
-个人使用，Cloudflare Workers Free + D1 Free 免费计划已经足够。
+可用 Cloudflare 免费计划部署。额度和用量说明见 [Workers 定价](https://developers.cloudflare.com/workers/platform/pricing/)和 [D1 定价](https://developers.cloudflare.com/d1/platform/pricing/)。
 
-一个直观参考：即使每天发送 100 次、刷新 500 次，也大约只是 700 次 Worker request，离免费额度 100,000 requests/day 还很远。D1 读写量也远低于免费额度。
+## 许可证
 
-截至 2026-05-11，Cloudflare 官方计费规则大致如下：
-
-| 项目 | 免费计划 | 付费计划起点 |
-| --- | --- | --- |
-| Workers 请求 | 100,000 requests/day | Workers Paid，$5/month 起，包含 10M requests/month |
-| Workers CPU time | 每次请求 10 ms CPU time | 每次请求默认 30,000 ms CPU time，可配置 |
-| D1 rows read | 5M rows/day | 25B rows/month |
-| D1 rows written | 100k rows/day | 50M rows/month |
-| D1 storage | 5 GB | 5 GB included，超出后按量计费 |
-| D1 数据库数量 | 10 个 | 50,000 个 |
-
-免费计划超过额度后通常不是自动扣费，而是相关请求失败或被限制。具体规则以 Cloudflare 官方计费页为准。
-
-Worker 的 request 按打到 Worker 的 HTTP 请求计算，不按数据库读写次数计算。D1 读写单独计算，主要看 rows read、rows written 和 storage。
-
-常见操作大致对应：
-
-| 操作 | Worker requests | D1 使用 |
-| --- | ---: | --- |
-| 打开页面且已有 token | 通常 2 次 | 读取最近 5 条 |
-| 打开页面但没有 token | 通常 1 次 | 0 |
-| 点击刷新 | 1 次 | 读取最近 5 条 |
-| 点击发送 | 通常 2 次 | 插入 1 条，删除超出的旧条，再读取列表 |
-| 点击清空历史 | 通常 2 次 | 删除现有记录，再读取列表 |
-
-如果有爬虫或 AI 扫描裸地址，它会消耗 Worker requests，但正常不会消耗 D1。原因是它没有 `APP_TOKEN`，API 会在进数据库前返回 `Unauthorized`。另外，token 放在 `#token=...` 里，URL fragment 正常不会被浏览器发送到服务器。
-
-本项目已经提供：
-
-- `/robots.txt`：`Disallow: /`
-- `X-Robots-Tag: noindex, nofollow`
-
-这些设置能减少守规矩的搜索引擎和爬虫收录，但不能阻止恶意扫描。不要把带 token 的完整链接发布到网页、GitHub、论坛或公开聊天记录。
-
-官方计费文档：
-
-- https://developers.cloudflare.com/workers/platform/pricing/
-- https://developers.cloudflare.com/d1/platform/pricing/
-
-## 查看用量
-
-Cloudflare Dashboard 里可以这样看：
-
-- Worker 请求量：`Workers & Pages` -> `textport` -> `Metrics`
-- D1 用量：`Storage & Databases` 或 `D1` -> `textport_db` -> `Metrics`
-- 账号级可计费用量：`Billing` -> `Billable Usage`
-
-## 准备
-
-你需要：
-
-- 一个 Cloudflare 账号
-- 本机安装 Node.js 18 或更高版本
-- 一个随机私密密钥
-
-生成密钥可以用：
-
-```bash
-openssl rand -hex 32
-```
-
-输出类似：
-
-```text
-0f3c6c9e9d6a4e5e9c7c7c6c1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c
-```
-
-后面把它记作 `APP_TOKEN`。
-
-## 第一次部署
-
-进入项目目录：
-
-```bash
-cd TextPort
-```
-
-安装依赖：
-
-```bash
-npm install
-```
-
-登录 Cloudflare：
-
-```bash
-npx wrangler login
-```
-
-浏览器会打开 Cloudflare 授权页，登录并授权 Wrangler。
-
-创建 D1 数据库：
-
-```bash
-npx wrangler d1 create textport_db
-```
-
-如果 Wrangler 问：
-
-```text
-Would you like Wrangler to add it on your behalf?
-```
-
-选择 `no`。本项目代码使用的绑定名是 `DB`，自动添加通常会用数据库名作为绑定名，容易和代码不一致。
-
-命令输出里会有类似这样的内容：
-
-```json
-{
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "textport_db",
-      "database_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-    }
-  ]
-}
-```
-
-复制配置模板：
-
-```bash
-cp wrangler.example.jsonc wrangler.jsonc
-```
-
-打开 `wrangler.jsonc`，把：
-
-```jsonc
-"database_id": "REPLACE_WITH_D1_DATABASE_ID"
-```
-
-替换成你自己的 `database_id`。
-
-应用数据库迁移：
-
-```bash
-npx wrangler d1 migrations apply textport_db --remote
-```
-
-设置访问密钥：
-
-```bash
-npx wrangler secret put APP_TOKEN
-```
-
-它会提示你输入值。粘贴刚才生成的随机密钥，然后回车。
-
-如果 Wrangler 问：
-
-```text
-There doesn't seem to be a Worker called "textport". Do you want to create a new Worker with that name and add secrets to it?
-```
-
-选择 `yes`。这是第一次部署前的正常提示，它会先创建同名 Worker 并保存 secret。
-
-部署：
-
-```bash
-npx wrangler deploy
-```
-
-如果 Wrangler 问：
-
-```text
-Would you like to register a workers.dev subdomain now?
-```
-
-选择 `yes`。这是给账号启用默认的 `workers.dev` 访问域名。
-
-部署后看到这些 warning 通常可以忽略：
-
-- `workers_dev is not in your Wrangler file`
-- `preview_urls setting is not in your Wrangler file`
-
-它们只是说明 Wrangler 使用了默认配置，不影响这个工具使用。
-
-成功后会看到 Worker 地址，类似：
-
-```text
-https://textport.你的账号.workers.dev
-```
-
-最终访问链接是：
-
-```text
-https://textport.你的账号.workers.dev/#token=你的私密密钥
-```
-
-把这个链接分别在 iPhone、Mac、Windows 打开即可。
-
-## iPhone 使用建议
-
-用 Safari 打开最终链接，然后：
-
-```text
-分享按钮 -> 添加到主屏幕
-```
-
-以后就像一个小 App 一样打开。
-
-## Windows / Mac 使用建议
-
-把最终链接加入浏览器书签。也可以在 Edge / Chrome 里安装为应用：
-
-```text
-浏览器菜单 -> 保存并共享 / 应用 -> 将此站点安装为应用
-```
-
-不同浏览器菜单名字略有差异。
-
-## 本地预览
-
-本地开发需要先设置 `.dev.vars`：
-
-```bash
-APP_TOKEN=你的私密密钥
-```
-
-然后应用本地 D1 迁移：
-
-```bash
-npx wrangler d1 migrations apply textport_db --local
-```
-
-启动本地 Worker：
-
-```bash
-npm run dev
-```
-
-打开终端里显示的本地地址，并追加 token：
-
-```text
-http://127.0.0.1:8787/#token=你的私密密钥
-```
-
-## 后续修改
-
-改完代码后重新部署：
-
-```bash
-npx wrangler deploy
-```
-
-## 其他
-
-超过 5 条的历史记录会被实际从 `messages` 表中删除，不只是前端隐藏。清空历史也会删除当前保存的全部文字。
-
-但从当前表里删除不等于云服务层面的不可恢复安全擦除。Cloudflare D1 有 Time Travel/恢复能力，所以不要传输高敏感内容。
-
-## License
-
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+[MIT](LICENSE)
