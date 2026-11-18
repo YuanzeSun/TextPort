@@ -1,5 +1,9 @@
 const MAX_MESSAGE_BYTES = 1_900_000;
+const MAX_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_MESSAGES = 5;
+const FILE_PREFIX = "clipboard/";
+const UPLOAD_GRACE_MS = 60 * 60 * 1000;
+const MESSAGE_COLUMNS = "id, text, created_at, file_name, file_size";
 const textEncoder = new TextEncoder();
 
 export default {
@@ -30,12 +34,26 @@ export default {
       return handleClear(request, env);
     }
 
-    const messageMatch = url.pathname.match(/^\/api\/messages\/(\d+)$/);
-    if (messageMatch && request.method === "DELETE") {
-      return handleDelete(request, env, Number(messageMatch[1]));
+    if (url.pathname === "/api/files" && request.method === "POST") {
+      return handleUpload(request, env);
+    }
+
+    const messageMatch = url.pathname.match(/^\/api\/messages\/(\d+)(\/file)?$/);
+    if (messageMatch) {
+      const id = Number(messageMatch[1]);
+      if (messageMatch[2] && request.method === "GET") {
+        return handleDownload(request, env, id);
+      }
+      if (!messageMatch[2] && request.method === "DELETE") {
+        return handleDelete(request, env, id);
+      }
     }
 
     return jsonResponse({ error: "Not found" }, 404);
+  },
+
+  async scheduled(_controller, env) {
+    if (env.FILES) await cleanOrphanedFiles(env);
   }
 };
 
@@ -44,10 +62,10 @@ async function handleList(request, env) {
   if (unauthorized) return unauthorized;
 
   const { results } = await env.DB.prepare(
-    "SELECT id, text, created_at FROM messages ORDER BY id DESC LIMIT ?"
+    "SELECT " + MESSAGE_COLUMNS + " FROM messages ORDER BY id DESC LIMIT ?"
   ).bind(MAX_MESSAGES).all();
 
-  return jsonResponse({ messages: results });
+  return jsonResponse({ messages: results.map(formatMessage) });
 }
 
 async function handleCreate(request, env) {
@@ -61,7 +79,7 @@ async function handleCreate(request, env) {
     return jsonResponse({ error: "Invalid JSON" }, 400);
   }
 
-  const text = typeof body.text === "string" ? body.text.trim() : "";
+  const text = typeof body?.text === "string" ? body.text.trim() : "";
   if (!text) {
     return jsonResponse({ error: "Text is required" }, 400);
   }
@@ -69,36 +87,158 @@ async function handleCreate(request, env) {
     return jsonResponse({ error: "文字过长" }, 400);
   }
 
-  const createdAt = Date.now();
-  const result = await env.DB.prepare(
-    "INSERT INTO messages (text, created_at) VALUES (?, ?) RETURNING id, text, created_at"
-  ).bind(text, createdAt).first();
+  return saveMessage(env, env.DB.prepare(
+    "INSERT INTO messages (text, created_at) VALUES (?, ?) RETURNING " + MESSAGE_COLUMNS
+  ).bind(text, Date.now()));
+}
 
-  await env.DB.prepare(
-    "DELETE FROM messages WHERE id NOT IN (SELECT id FROM messages ORDER BY id DESC LIMIT ?)"
-  ).bind(MAX_MESSAGES).run();
+async function handleUpload(request, env) {
+  const unauthorized = await requireAuth(request, env);
+  if (unauthorized) return unauthorized;
+  if (!env.FILES) return jsonResponse({ error: "文件存储未配置" }, 503);
 
-  return jsonResponse({ message: result }, 201);
+  const name = getUploadName(request);
+  if (!name) return jsonResponse({ error: "文件名无效" }, 400);
+
+  const length = request.headers.get("Content-Length");
+  if (length === null || !/^\d+$/.test(length)) {
+    return jsonResponse({ error: "无法确定文件大小" }, 411);
+  }
+  const size = Number(length);
+  if (size > MAX_FILE_BYTES) {
+    return jsonResponse({ error: "单个文件不得超过 50 MiB" }, 413);
+  }
+  if (size > 0 && !request.body) {
+    return jsonResponse({ error: "缺少文件内容" }, 400);
+  }
+
+  const key = FILE_PREFIX + crypto.randomUUID();
+  let file;
+  try {
+    file = await env.FILES.put(key, size === 0 ? new Uint8Array(0) : request.body);
+  } catch (error) {
+    console.error("R2 upload failed", error);
+    return jsonResponse({ error: "上传失败，请重试" }, 502);
+  }
+
+  // Only add files whose uploads are still too recent for orphan cleanup.
+  return saveMessage(env, env.DB.prepare(
+    "INSERT INTO messages (text, created_at, file_key, file_name, file_size) "
+      + "SELECT '', ?, ?, ?, ? WHERE ? > unixepoch() * 1000 - ? RETURNING " + MESSAGE_COLUMNS
+  ).bind(Date.now(), key, name, file.size, file.uploaded.getTime(), UPLOAD_GRACE_MS));
+}
+
+function getUploadName(request) {
+  try {
+    const name = decodeURIComponent(request.headers.get("X-File-Name") || "");
+    if (!name.trim() || name === "." || name === ".." || getUtf8ByteLength(name) > 1024) {
+      return "";
+    }
+    return /[\x00-\x1f\x7f/\\]/.test(name) ? "" : name;
+  } catch {
+    return "";
+  }
+}
+
+async function saveMessage(env, insert) {
+  const prune = env.DB.prepare(
+    "DELETE FROM messages WHERE id NOT IN (SELECT id FROM messages ORDER BY id DESC LIMIT ?) RETURNING file_key"
+  ).bind(MAX_MESSAGES);
+  const [created, removed] = await env.DB.batch([insert, prune]);
+  await deleteFiles(env, removed.results);
+
+  const message = created.results[0];
+  if (!message) return jsonResponse({ error: "上传已超时，请重试" }, 503);
+  return jsonResponse({ message: formatMessage(message) }, 201);
+}
+
+function formatMessage({ id, text, created_at, file_name, file_size }) {
+  if (file_name !== null) {
+    return { id, created_at, type: "file", name: file_name, size: file_size };
+  }
+  return { id, text, created_at };
+}
+
+async function handleDownload(request, env, id) {
+  const unauthorized = await requireAuth(request, env);
+  if (unauthorized) return unauthorized;
+  if (!isValidMessageId(id)) return jsonResponse({ error: "Invalid message id" }, 400);
+  if (!env.FILES) return jsonResponse({ error: "文件存储未配置" }, 503);
+
+  const message = await env.DB.prepare(
+    "SELECT file_key, file_name FROM messages WHERE id = ?"
+  ).bind(id).first();
+  if (!message?.file_key) return jsonResponse({ error: "文件已从历史中移除" }, 404);
+
+  const file = await env.FILES.get(message.file_key);
+  if (!file) return jsonResponse({ error: "文件已从历史中移除" }, 404);
+
+  const name = encodeURIComponent(message.file_name).replace(/['()*]/g, (character) =>
+    "%" + character.charCodeAt(0).toString(16).toUpperCase()
+  );
+  return new Response(file.body, {
+    headers: {
+      "content-type": "application/octet-stream",
+      "content-length": String(file.size),
+      "content-disposition": "attachment; filename=\"download\"; filename*=UTF-8''" + name,
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      "x-robots-tag": "noindex, nofollow"
+    }
+  });
+}
+
+async function deleteFiles(env, removed) {
+  const keys = removed.map(({ file_key }) => file_key).filter(Boolean);
+  if (!env.FILES || !keys.length) return;
+  try {
+    await env.FILES.delete(keys);
+  } catch (error) {
+    console.error("R2 cleanup failed", error);
+  }
+}
+
+async function cleanOrphanedFiles(env) {
+  const cutoff = Math.floor(Date.now() / 1000) * 1000 - UPLOAD_GRACE_MS;
+  let cursor;
+  do {
+    const page = await env.FILES.list({ prefix: FILE_PREFIX, cursor });
+    const candidates = page.objects.filter(({ uploaded }) => uploaded.getTime() <= cutoff);
+    if (candidates.length) {
+      const { results } = await env.DB.prepare(
+        "SELECT file_key FROM messages WHERE file_key IS NOT NULL"
+      ).all();
+      const active = new Set(results.map(({ file_key }) => file_key));
+      const orphaned = candidates.filter(({ key }) => !active.has(key));
+      if (orphaned.length) await env.FILES.delete(orphaned.map(({ key }) => key));
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
 }
 
 async function handleClear(request, env) {
   const unauthorized = await requireAuth(request, env);
   if (unauthorized) return unauthorized;
 
-  await env.DB.prepare("DELETE FROM messages").run();
+  const { results } = await env.DB.prepare("DELETE FROM messages RETURNING file_key").all();
+  await deleteFiles(env, results);
   return jsonResponse({ ok: true });
 }
 
 async function handleDelete(request, env, id) {
   const unauthorized = await requireAuth(request, env);
   if (unauthorized) return unauthorized;
+  if (!isValidMessageId(id)) return jsonResponse({ error: "Invalid message id" }, 400);
 
-  if (!Number.isSafeInteger(id) || id < 1) {
-    return jsonResponse({ error: "Invalid message id" }, 400);
-  }
+  const { results } = await env.DB.prepare(
+    "DELETE FROM messages WHERE id = ? RETURNING file_key"
+  ).bind(id).all();
+  await deleteFiles(env, results);
+  return jsonResponse({ ok: true, deleted: results.length > 0 });
+}
 
-  const result = await env.DB.prepare("DELETE FROM messages WHERE id = ?").bind(id).run();
-  return jsonResponse({ ok: true, deleted: result.meta.changes > 0 });
+function isValidMessageId(id) {
+  return Number.isSafeInteger(id) && id >= 1;
 }
 
 async function requireAuth(request, env) {
@@ -361,6 +501,12 @@ const APP_HTML = `<!doctype html>
       gap: 10px;
     }
 
+    .selected-files {
+      margin-top: 8px;
+      overflow-wrap: anywhere;
+      white-space: pre-line;
+    }
+
     button {
       min-height: 42px;
       border: 1px solid var(--border);
@@ -432,6 +578,14 @@ const APP_HTML = `<!doctype html>
       background: color-mix(in srgb, var(--surface) 88%, var(--surface-soft));
     }
 
+    .message-file {
+      cursor: default;
+    }
+
+    .file-size {
+      display: block;
+    }
+
     .message:focus-visible {
       border-color: var(--accent);
       box-shadow: 0 0 0 4px var(--focus);
@@ -488,6 +642,11 @@ const APP_HTML = `<!doctype html>
       border-radius: 6px;
       color: var(--muted);
       padding: 0;
+    }
+
+    .message-download {
+      min-height: 28px;
+      padding: 4px 8px;
     }
 
     .message-toggle {
@@ -592,7 +751,7 @@ const APP_HTML = `<!doctype html>
   <main>
     <header>
       <h1>TextPort</h1>
-      <div id="status" class="status"></div>
+      <div id="status" class="status" role="status"></div>
     </header>
 
     <div class="shell">
@@ -609,13 +768,18 @@ const APP_HTML = `<!doctype html>
 
       <section>
         <div class="section-head">
-          <label for="textInput">发送文字</label>
+          <label for="textInput">剪贴板</label>
           <span id="characterCount" class="hint character-count">0 字符 · 保存最近 5 条</span>
         </div>
-        <textarea id="textInput"></textarea>
+        <textarea id="textInput" placeholder="输入文字，或在此粘贴文件"></textarea>
+        <input id="fileInput" type="file" multiple hidden>
+        <div id="selectedFiles" class="hint selected-files" hidden></div>
         <div class="actions message-actions">
           <div class="message-actions-left">
-            <button id="sendButton" class="primary" type="button">发送</button>
+            <button id="sendButton" class="primary" type="button">发送文字</button>
+            <button id="chooseFilesButton" type="button">选择文件</button>
+            <button id="uploadButton" class="primary" type="button" hidden>上传文件</button>
+            <button id="removeFilesButton" type="button" hidden>移除待上传文件</button>
             <button id="refreshButton" type="button">刷新</button>
           </div>
           <button id="clearButton" class="danger" type="button">清空历史</button>
@@ -624,8 +788,8 @@ const APP_HTML = `<!doctype html>
 
       <section>
         <div class="section-head">
-          <div class="section-title">最近文字</div>
-          <span class="hint">点击任意条目复制</span>
+          <div class="section-title">最近记录</div>
+          <span class="hint">点击文字复制，点击「下载」保存文件</span>
         </div>
         <div id="messages" class="message-list"></div>
       </section>
@@ -638,6 +802,11 @@ const APP_HTML = `<!doctype html>
     const tokenInput = document.querySelector("#tokenInput");
     const saveTokenButton = document.querySelector("#saveTokenButton");
     const textInput = document.querySelector("#textInput");
+    const fileInput = document.querySelector("#fileInput");
+    const selectedFilesEl = document.querySelector("#selectedFiles");
+    const chooseFilesButton = document.querySelector("#chooseFilesButton");
+    const uploadButton = document.querySelector("#uploadButton");
+    const removeFilesButton = document.querySelector("#removeFilesButton");
     const sendButton = document.querySelector("#sendButton");
     const refreshButton = document.querySelector("#refreshButton");
     const clearButton = document.querySelector("#clearButton");
@@ -647,12 +816,18 @@ const APP_HTML = `<!doctype html>
 
     const TOKEN_KEY = "textport-token";
     const MAX_MESSAGE_BYTES = 1900000;
+    const MAX_FILE_BYTES = ${MAX_FILE_BYTES};
+    const MAX_MESSAGES = ${MAX_MESSAGES};
     const COLLAPSE_MESSAGE_CHARACTERS = 360;
     const COLLAPSE_MESSAGE_LINES = 8;
     const textEncoder = new TextEncoder();
     const characterSegmenter = typeof Intl !== "undefined" && Intl.Segmenter
       ? new Intl.Segmenter("zh-CN", { granularity: "grapheme" })
       : null;
+
+    let statusTimeout;
+    let pendingFiles = [];
+    let uploadingFiles = false;
 
     function tokenFromHash() {
       const hash = new URLSearchParams(location.hash.slice(1));
@@ -674,8 +849,10 @@ const APP_HTML = `<!doctype html>
       return token;
     }
 
-    function setStatus(text) {
-      statusEl.textContent = text || "";
+    function setStatus(text, duration = 0) {
+      clearTimeout(statusTimeout);
+      statusEl.textContent = text;
+      if (duration) statusTimeout = setTimeout(() => setStatus(""), duration);
     }
 
     function getUtf8ByteLength(value) {
@@ -702,7 +879,7 @@ const APP_HTML = `<!doctype html>
         || text.split(/\\r\\n|\\r|\\n/).length > COLLAPSE_MESSAGE_LINES;
     }
 
-    async function api(path, options = {}) {
+    async function api(path, options = {}, download = false) {
       const token = requireToken();
       if (!token) {
         throw new Error("请先填写访问密钥");
@@ -717,6 +894,7 @@ const APP_HTML = `<!doctype html>
         }
       });
 
+      if (response.ok && download) return response.blob();
       const body = await response.json().catch(() => ({}));
       if (!response.ok) {
         throw new Error(body.error || "请求失败");
@@ -725,37 +903,137 @@ const APP_HTML = `<!doctype html>
       return body;
     }
 
+    function formatFileSize(bytes) {
+      if (bytes < 1024) return bytes + " B";
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KiB";
+      return (bytes / (1024 * 1024)).toFixed(1) + " MiB";
+    }
+
+    function renderPendingFiles() {
+      const hasFiles = pendingFiles.length > 0;
+      selectedFilesEl.hidden = uploadButton.hidden = removeFilesButton.hidden = !hasFiles;
+      chooseFilesButton.disabled = uploadButton.disabled = removeFilesButton.disabled = uploadingFiles;
+      selectedFilesEl.textContent = pendingFiles.map((file) =>
+        file.name + " · " + formatFileSize(file.size)
+      ).join("\\n");
+    }
+
+    function stageFiles(files) {
+      if (uploadingFiles || !files.length) return;
+      if (pendingFiles.length + files.length > MAX_MESSAGES) {
+        setStatus("一次最多选择 " + MAX_MESSAGES + " 个文件");
+        return;
+      }
+      if (files.some((file) => file.size > MAX_FILE_BYTES)) {
+        setStatus("单个文件不得超过 50 MiB");
+        return;
+      }
+      pendingFiles.push(...files);
+      renderPendingFiles();
+      setStatus("");
+    }
+
+    async function uploadFiles() {
+      if (uploadingFiles || !pendingFiles.length) return;
+      uploadingFiles = true;
+      renderPendingFiles();
+      const total = pendingFiles.length;
+      let sent = 0;
+      let failure = "";
+
+      try {
+        while (pendingFiles.length) {
+          const file = pendingFiles[0];
+          setStatus("正在上传 " + (sent + 1) + " / " + total + "...");
+          await api("/api/files", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/octet-stream",
+              "X-File-Name": encodeURIComponent(file.name)
+            },
+            body: file
+          });
+          pendingFiles.shift();
+          sent += 1;
+          renderPendingFiles();
+        }
+      } catch (error) {
+        failure = error.message;
+      }
+
+      if (sent) {
+        try {
+          await refreshMessages(false);
+        } catch {
+          failure ||= "刷新失败，请手动刷新";
+        }
+      }
+      uploadingFiles = false;
+      renderPendingFiles();
+      const summary = sent ? "已上传 " + sent + " 个文件" : "";
+      setStatus([summary, failure].filter(Boolean).join("，"), failure ? 0 : 1200);
+    }
+
+    async function downloadFile(message) {
+      const blob = await api("/api/messages/" + message.id + "/file", {}, true);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = message.name;
+      link.hidden = true;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    }
+
     function renderMessages(messages) {
       messagesEl.textContent = "";
 
       if (!messages.length) {
         const empty = document.createElement("div");
         empty.className = "empty";
-        empty.textContent = "还没有文字";
+        empty.textContent = "还没有记录";
         messagesEl.append(empty);
         return;
       }
 
       for (const message of messages) {
+        const isFile = message.type === "file";
         const item = document.createElement("div");
-        item.className = "message";
-        item.role = "button";
-        item.tabIndex = 0;
+        item.className = isFile ? "message message-file" : "message";
 
         const body = document.createElement("div");
         body.className = "message-body";
 
-        const text = document.createElement("div");
-        text.className = "message-text";
-        text.textContent = message.text;
+        const content = document.createElement("div");
+        content.className = "message-text";
+        content.textContent = isFile ? message.name : message.text;
 
-        const toggle = document.createElement("button");
-        toggle.className = "message-icon-button message-toggle";
-        toggle.type = "button";
-        toggle.textContent = "▶";
-        toggle.title = "展开";
-        toggle.setAttribute("aria-label", "展开消息");
-        toggle.setAttribute("aria-expanded", "false");
+        const action = document.createElement("button");
+        action.type = "button";
+        if (isFile) {
+          const size = document.createElement("span");
+          size.className = "hint file-size";
+          size.textContent = formatFileSize(message.size);
+          content.append(size);
+          action.className = "message-download";
+          action.textContent = "下载";
+          action.addEventListener("click", async () => {
+            action.disabled = true;
+            setStatus("正在下载...");
+            try {
+              await downloadFile(message);
+              setStatus("已下载", 1200);
+            } catch (error) {
+              setStatus(error.message);
+            } finally {
+              action.disabled = false;
+            }
+          });
+        } else {
+          enableTextActions(item, action, message.text);
+        }
 
         const deleteButton = document.createElement("button");
         deleteButton.className = "message-icon-button message-delete";
@@ -768,40 +1046,8 @@ const APP_HTML = `<!doctype html>
         time.className = "message-time";
         time.textContent = new Date(message.created_at).toLocaleString();
 
-        const isCollapsible = isLongMessage(message.text);
-        if (isCollapsible) {
-          item.classList.add("is-collapsible", "is-collapsed");
-        }
-
-        body.append(text, toggle, deleteButton);
+        body.append(content, action, deleteButton);
         item.append(body, time);
-
-        const copyMessage = async () => {
-          try {
-            await navigator.clipboard.writeText(message.text);
-            setStatus("已复制");
-            setTimeout(() => setStatus(""), 1200);
-          } catch {
-            setStatus("复制失败，请手动选择文字");
-          }
-        };
-
-        item.addEventListener("click", copyMessage);
-        item.addEventListener("keydown", (event) => {
-          if (event.key !== "Enter" && event.key !== " ") return;
-          event.preventDefault();
-          copyMessage();
-        });
-
-        toggle.addEventListener("click", (event) => {
-          event.stopPropagation();
-          const isExpanded = item.classList.toggle("is-expanded");
-          item.classList.toggle("is-collapsed", !isExpanded);
-          toggle.textContent = isExpanded ? "▼" : "▶";
-          toggle.title = isExpanded ? "折叠" : "展开";
-          toggle.setAttribute("aria-label", isExpanded ? "折叠消息" : "展开消息");
-          toggle.setAttribute("aria-expanded", String(isExpanded));
-        });
 
         deleteButton.addEventListener("click", async (event) => {
           event.stopPropagation();
@@ -810,6 +1056,8 @@ const APP_HTML = `<!doctype html>
           deleteButton.disabled = true;
           try {
             await deleteMessage(message.id);
+          } catch (error) {
+            setStatus(error.message);
           } finally {
             deleteButton.disabled = false;
           }
@@ -819,12 +1067,47 @@ const APP_HTML = `<!doctype html>
       }
     }
 
-    async function refreshMessages() {
-      setStatus("正在刷新...");
+    function enableTextActions(item, toggle, text) {
+      item.role = "button";
+      item.tabIndex = 0;
+      const copyMessage = async () => {
+        try {
+          await navigator.clipboard.writeText(text);
+          setStatus("已复制", 1200);
+        } catch {
+          setStatus("复制失败，请手动选择文字");
+        }
+      };
+      item.addEventListener("click", copyMessage);
+      item.addEventListener("keydown", (event) => {
+        if (event.target !== item || (event.key !== "Enter" && event.key !== " ")) return;
+        event.preventDefault();
+        copyMessage();
+      });
+
+      toggle.className = "message-icon-button message-toggle";
+      if (!isLongMessage(text)) return;
+      item.classList.add("is-collapsible", "is-collapsed");
+      toggle.textContent = "▶";
+      toggle.title = "展开";
+      toggle.setAttribute("aria-label", "展开消息");
+      toggle.setAttribute("aria-expanded", "false");
+      toggle.addEventListener("click", (event) => {
+        event.stopPropagation();
+        const isExpanded = item.classList.toggle("is-expanded");
+        item.classList.toggle("is-collapsed", !isExpanded);
+        toggle.textContent = isExpanded ? "▼" : "▶";
+        toggle.title = isExpanded ? "折叠" : "展开";
+        toggle.setAttribute("aria-label", isExpanded ? "折叠消息" : "展开消息");
+        toggle.setAttribute("aria-expanded", String(isExpanded));
+      });
+    }
+
+    async function refreshMessages(announce = true) {
+      if (announce) setStatus("正在刷新...");
       const body = await api("/api/messages");
       renderMessages(body.messages || []);
-      setStatus("已刷新");
-      setTimeout(() => setStatus(""), 1200);
+      if (announce) setStatus("已刷新", 1200);
     }
 
     async function sendMessage() {
@@ -848,9 +1131,8 @@ const APP_HTML = `<!doctype html>
         });
         textInput.value = "";
         updateCharacterCount();
-        await refreshMessages();
-        setStatus("已发送");
-        setTimeout(() => setStatus(""), 1200);
+        await refreshMessages(false);
+        setStatus("已发送", 1200);
       } finally {
         sendButton.disabled = false;
       }
@@ -859,16 +1141,14 @@ const APP_HTML = `<!doctype html>
     async function clearMessages() {
       if (!confirm("清空历史？")) return;
       await api("/api/messages", { method: "DELETE" });
-      await refreshMessages();
-      setStatus("历史已清空");
-      setTimeout(() => setStatus(""), 1200);
+      await refreshMessages(false);
+      setStatus("历史已清空", 1200);
     }
 
     async function deleteMessage(id) {
       await api("/api/messages/" + encodeURIComponent(id), { method: "DELETE" });
-      await refreshMessages();
-      setStatus("已删除");
-      setTimeout(() => setStatus(""), 1200);
+      await refreshMessages(false);
+      setStatus("已删除", 1200);
     }
 
     saveTokenButton.addEventListener("click", () => {
@@ -884,6 +1164,18 @@ const APP_HTML = `<!doctype html>
       sendMessage().catch((error) => setStatus(error.message));
     });
 
+    chooseFilesButton.addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", () => {
+      stageFiles(Array.from(fileInput.files));
+      fileInput.value = "";
+    });
+    uploadButton.addEventListener("click", uploadFiles);
+    removeFilesButton.addEventListener("click", () => {
+      pendingFiles = [];
+      renderPendingFiles();
+      setStatus("");
+    });
+
     refreshButton.addEventListener("click", () => {
       refreshMessages().catch((error) => setStatus(error.message));
     });
@@ -895,7 +1187,15 @@ const APP_HTML = `<!doctype html>
     textInput.addEventListener("input", updateCharacterCount);
     textInput.addEventListener("change", updateCharacterCount);
     textInput.addEventListener("keyup", updateCharacterCount);
-    textInput.addEventListener("paste", () => requestAnimationFrame(updateCharacterCount));
+    textInput.addEventListener("paste", (event) => {
+      const files = Array.from(event.clipboardData?.files || []);
+      if (files.length) {
+        event.preventDefault();
+        stageFiles(files);
+      } else {
+        requestAnimationFrame(updateCharacterCount);
+      }
+    });
 
     requireToken();
     updateCharacterCount();

@@ -12,5 +12,14 @@
       "database_name": "textport_db",
       "database_id": "REPLACE_WITH_D1_DATABASE_ID"
     }
-  ]
+  ],
+  "r2_buckets": [
+    {
+      "binding": "FILES",
+      "bucket_name": "textport-files"
+    }
+  ],
+  "triggers": {
+    "crons": ["0 * * * *"]
+  }
 }
